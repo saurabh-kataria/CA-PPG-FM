@@ -295,3 +295,74 @@ class XLSTMModel(nn.Module):
         context = self.dropout(context)
         out = self.fc(context)
         return out
+
+class SimpleModelSTFT(nn.Module):
+    def __init__(self, fs=40, n_fft=40, hop_length=40):
+        super().__init__()
+        self.fs = fs
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.window = torch.hann_window(window_length=self.n_fft)
+
+        self.S = 120  # Known sequence length
+        self.n_freqs = self.n_fft // 2 + 1  # Number of frequency bins
+        self.P_stft = 2 * self.n_freqs      # Real and imaginary parts concatenated
+
+        # Total input dimension after flattening
+        self.input_dim_total = self.S * self.P_stft
+
+        # Initialize the linear layer
+        self.fc = nn.Linear(self.input_dim_total, 1)  # Output dimension is 1
+
+        # Specify layers where manifold mixup can be applied
+        self.manifold_mixup_layers = ['stft_output', 'pre_fc']
+
+    def forward(self, x, mixup_layer=None, lam=None, index=None):
+        # x shape: (B, S, P), where P = fs (40Hz), B is batch size
+        B, S_inp, P = x.shape
+        assert S_inp == self.S, f"Expected sequence length {self.S}, but got {S_inp}"
+
+
+        # Compute STFT features
+        x_stft = self.compute_stft_features(x)  # Shape: (B, S, P_stft)
+
+        # Potential manifold mixup point after STFT
+        if mixup_layer == 'stft_output' and lam is not None and index is not None:
+            x_stft = lam * x_stft + (1 - lam) * x_stft[index]
+
+        # Flatten x_stft to shape (B, S * P_stft)
+        x_flat = x_stft.view(B, -1)  # Shape: (B, input_dim_total)
+
+        # Potential manifold mixup point after flattening and before fc layer
+        if mixup_layer == 'pre_fc' and lam is not None and index is not None:
+            x_flat = lam * x_flat + (1 - lam) * x_flat[index]
+
+        # Apply linear layer to get output shape (B, 1)
+        out = self.fc(x_flat)
+        return out
+
+    def compute_stft_features(self, x):
+        B, S, P = x.shape
+        # Reshape x to (B * S, P)
+        x_reshaped = x.view(B * S, P)
+
+        # Ensure the window is on the correct device
+        self.window = self.window.to(x.device)
+
+        # Compute STFT
+        x_stft = torch.stft(
+            x_reshaped,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=self.window,
+            center=False,
+            return_complex=False
+        )  # Output shape: (B * S, n_freqs, 2)
+
+        # Flatten the last two dimensions (n_freqs and 2)
+        x_stft_features = x_stft.reshape(B * S, -1)  # Shape: (B * S, n_freqs * 2)
+
+        # Reshape to (B, S, P_stft)
+        x_stft_features = x_stft_features.view(B, S, -1)  # Shape: (B, S, P_stft)
+
+        return x_stft_features
